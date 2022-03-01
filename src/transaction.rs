@@ -1,19 +1,27 @@
 use secp256k1::{Message, Secp256k1, SecretKey};
 use rlp::{RlpStream};
 use tiny_keccak::{Keccak, Hasher};
+use serde::{Serialize, Deserialize};
+use ethereum_types::{H256, H160, U256};
 use hex;
 
 const ETH_CHAIN_ID: u64 = 1;
 const RINKEBY_CHAIN_ID: u64 = 4;
-const SK_TEST_1: &str = "4646464646464646464646464646464646464646464646464646464646464646";
 
-#[derive(Debug, PartialEq)]
+// So when deserializing from JSON to this struct, using rust primitive types like u128 doesn't
+// work, but U256 does, I have no idea why. My guess is that the derive macro for deserialize
+// looks at the hex string, and U256 type has a method from_str to parse a string and somehow
+// this is called?? But using u128 doesn't automatically convert from radix string to u128.
+// So for now I'll use these wrapper types.
+#[derive(Deserialize, Debug, PartialEq)]
 pub struct LegacyTransaction {
-    pub nonce: u128,
-    pub gas_price: u128,
-    pub gas_limit: u128,
-    pub to: Vec<u8>,
-    pub value: u128,
+    pub nonce: U256,
+    #[serde(rename = "gasPrice")]
+    pub gas_price: U256,
+    #[serde(rename = "gas")]
+    pub gas_limit: U256,
+    pub to: Option<H160>,
+    pub value: U256,
     pub data: Vec<u8>,
     pub v: u64,
     pub r: Vec<u8>,
@@ -32,11 +40,11 @@ impl LegacyTransaction {
         chain_id: u64
     ) -> Self {
         LegacyTransaction {
-            nonce,
-            gas_price,
-            gas_limit,
-            to,
-            value,
+            nonce: U256::from(nonce),
+            gas_price: U256::from(gas_price),
+            gas_limit: U256::from(gas_limit),
+            to: Some(H160::from_slice(&to)),
+            value: U256::from(value),
             data,
             v: chain_id,
             r: vec![0],
@@ -50,9 +58,23 @@ impl LegacyTransaction {
         let hashed_txn = keccak256(&encoded_txn);
         let sig = EcdsaSig::ecdsa_sign(&hashed_txn, secret_key);
 
+        // TODO: figure out why this is needed
+        let mut r_n = sig.r;
+        let mut s_n = sig.s;
+
+        while r_n[0] == 0 {
+            r_n.remove(0);
+        }
+        while s_n[0] == 0 {
+            s_n.remove(0);
+        }
+
         self.v = sig.v + self.v * 2 + 35;
-        self.r = sig.r;
-        self.s = sig.s;
+        self.r = r_n;
+        self.s = s_n;
+
+        println!("{:?}", self);
+        println!("{:?}", self.rlp_encode());
         
         self.rlp_encode()
     }
@@ -63,7 +85,13 @@ impl LegacyTransaction {
         s.append(&self.nonce);
         s.append(&self.gas_price);
         s.append(&self.gas_limit);
-        s.append(&self.to);
+
+        if let Some(v) = self.to {
+            s.append(&v);
+        } else {
+            s.append(&vec![]);
+        }
+
         s.append(&self.value);
         s.append(&self.data);
         s.append(&self.v);
@@ -105,7 +133,28 @@ impl EcdsaSig {
 
 #[cfg(test)]
 mod test {
+    use std::io::Read;
     use super::*;
+    use rstest::rstest;
+
+    #[rstest]
+    #[case("83646f67", "dog")]
+    //#[case("c7c0c1c0c3c0c1c0", "VALID")]
+    //#[case("bf0f000000000000021111", "INVALID")]
+    //#[case("c6827a77c10401", vec![ "zw", vec![ 4 ], 1 ])]
+    fn test_rlp_decode(#[case] input: String, #[case] expected: String) {
+        let data = hex::decode(input).unwrap();
+        let decoded: String = rlp::decode(&data).unwrap();
+        assert_eq!(expected, decoded);
+    }
+
+    #[rstest]
+    #[case("dog", "83646f67")]
+    //#[case("VALID", "c7c0c1c0c3c0c1c0")]
+    fn test_rlp_encode(#[case] input: String, #[case] expected: String) {
+        let encoded = rlp::encode(&input);
+        assert_eq!(expected, hex::encode(encoded));
+    }
 
     #[test]
     fn test_rlp_encode_txn() {
@@ -121,7 +170,7 @@ mod test {
         println!("{:?}", encoded);
     }
 
-    #[test]
+/*    #[test]
     fn test_create_new_legacy_txn() {
         let result = LegacyTransaction::new(10, 10, 10, vec![], 10, vec![], RINKEBY_CHAIN_ID);
         let expected = LegacyTransaction {
@@ -137,30 +186,27 @@ mod test {
         };
         
         assert_eq!(result, expected);
-    }
+    }*/
 
     #[test]
-    fn test_sign_legacy_txn() {
-        let nonce = u128::from_str_radix("9", 16).unwrap();
-        let gas_price = u128::from_str_radix("4a817c800", 16).unwrap();
-        let gas_limit = u128::from_str_radix("5208", 16).unwrap();
-        let to = hex::decode("3535353535353535353535353535353535353535").unwrap();
-        let value = u128::from_str_radix("de0b6b3a7640000", 16).unwrap();
-        let data = vec![];
+    fn test_sign_legacy_txns() {
+        use std::fs::File;
 
-        let mut txn = LegacyTransaction::new(nonce, gas_price, gas_limit, to, value, data, ETH_CHAIN_ID);
-        let secret_key = hex::decode(SK_TEST_1).unwrap();
-        let result = txn.sign(&secret_key);
+        #[derive(Deserialize)]
+        struct Signing {
+            private_key: U256,
+            signed: Vec<u8>,
+        }
 
-        let expected: Vec<u8> = vec![248, 108, 9, 133, 4, 168, 23, 200, 0, 130, 82, 8, 148, 53, 53,
-                            53, 53, 53, 53, 53, 53, 53, 53, 53, 53, 53, 53, 53, 53, 53, 53, 53, 53,
-                            136, 13, 224, 182, 179, 167, 100, 0, 0, 128, 37, 160, 40, 239, 97, 52,
-                            11, 217, 57, 188, 33, 149, 254, 83, 117, 103, 134, 96, 3, 225, 161, 93,
-                            60, 113, 255, 99, 225, 89, 6, 32, 170, 99, 98, 118, 160, 103, 203, 233,
-                            216, 153, 127, 118, 26, 236, 183, 3, 48, 75, 56, 0, 204, 245, 85, 201,
-                            243, 220, 100, 33, 75, 41, 127, 177, 150, 106, 59, 109, 131];
+        let mut file = File::open("./tests/test_eth_txns.json").unwrap();
+        let mut f_string = String::new();
+        file.read_to_string(&mut f_string).unwrap();
+        let txns: Vec<(LegacyTransaction, Signing)> = serde_json::from_str(&f_string).unwrap();
 
-        assert_eq!(result, expected);
+        for (mut txn, signed) in txns {
+            let sk: [u8; 32] = signed.private_key.try_into().unwrap();
+            assert_eq!(signed.signed, txn.sign(&sk));
+        }
     }
 }
 
